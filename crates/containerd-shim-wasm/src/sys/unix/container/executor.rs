@@ -11,7 +11,7 @@ use containerd_shimkit::AmbientRuntime;
 use libcontainer::workload::default::DefaultExecutor;
 use libcontainer::workload::{
     Executor as LibcontainerExecutor, ExecutorError as LibcontainerExecutorError,
-    ExecutorSetEnvsError, ExecutorValidationError,
+    ExecutorValidationError,
 };
 use oci_spec::runtime::Spec;
 
@@ -61,6 +61,20 @@ impl<S: Shim> LibcontainerExecutor for Executor<S> {
                 DefaultExecutor {}.exec(spec)
             }
             ExecutorType::Wasm(container) => {
+                // Because the shim will manage the envs itself, the env that was previously set via
+                // DefaultExecutor setup_envs is being cleared. The expectation is that the shim will
+                // call `RuntimeContext::envs()` to get the container's envs and set them in the `Engine::run_wasi`
+                // function. This way, the shim can decide how to pass the envs to the WASI context.
+                //
+                // Still, native containers need the envs set up. This can't be decided during
+                // setup_env implementation, because the spec is missing.
+                //
+                // See the following issues for more context:
+                // https://github.com/containerd/runwasi/issues/619
+                // https://github.com/containers/youki/issues/2815
+                if let Err(err) = (DefaultExecutor {}).setup_envs(HashMap::new()) {
+                    log::warn!("error clearing up envs using libcontainer: {err}");
+                }
                 let ctx = self.ctx(spec);
                 log::info!("calling start function");
                 match container.run_wasi(&ctx).block_on() {
@@ -72,21 +86,6 @@ impl<S: Shim> LibcontainerExecutor for Executor<S> {
                 };
             }
         }
-    }
-
-    // This is an no-op for the Wasm `Executor`. Instead of youki's libcontainer setting the envs
-    // in the shim process, the shim will manage the envs itself. The expectation is that the shim will
-    // call `RuntimeContext::envs()` to get the container's envs and set them in the `Engine::run_wasi`
-    // function. This way, the shim can decide how to pass the envs to the WASI context.
-    //
-    // See the following issues for more context:
-    // https://github.com/containerd/runwasi/issues/619
-    // https://github.com/containers/youki/issues/2815
-    fn setup_envs(
-        &self,
-        _: HashMap<String, String>,
-    ) -> std::result::Result<(), ExecutorSetEnvsError> {
-        Ok(())
     }
 }
 
