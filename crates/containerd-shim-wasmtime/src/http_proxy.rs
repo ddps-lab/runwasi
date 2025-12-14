@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -15,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use wasmtime::Store;
 use wasmtime::component::ResourceTable;
+use wasmtime_wasi::{DirPerms, FilePerms};
 use wasmtime_wasi_http::bindings::ProxyPre;
 use wasmtime_wasi_http::bindings::http::types::Scheme;
 use wasmtime_wasi_http::body::HyperOutgoingBody;
@@ -102,8 +104,30 @@ pub(crate) async fn serve_conn(
 
     log::info!("Serving HTTP on http://{}/", listener.local_addr()?);
 
+    // Extract bind mount destinations from OCI spec mounts for preopening
+    let preopened_dirs: Vec<PathBuf> = ctx
+        .mounts()
+        .map(|mounts| {
+            mounts
+                .iter()
+                .filter(|m| {
+                    let dest = m.destination().to_string_lossy();
+                    let is_bind = m.typ().as_deref() == Some("bind");
+                    let is_system = dest.starts_with("/proc")
+                        || dest.starts_with("/sys")
+                        || dest.starts_with("/dev")
+                        || dest == "/";
+                    is_bind && !is_system
+                })
+                .map(|m| m.destination().to_path_buf())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    log::info!("HTTP Proxy: preopened_dirs = {:?}", preopened_dirs);
+
     let env = env.into_iter().collect();
-    let handler = Arc::new(ProxyHandler::new(instance, env, tracker.clone()));
+    let handler = Arc::new(ProxyHandler::new(instance, env, preopened_dirs, tracker.clone()));
 
     loop {
         let stream = tokio::select! {
@@ -145,6 +169,7 @@ struct ProxyHandler {
     instance_pre: ProxyPre<WasiPreview2Ctx>,
     next_id: AtomicU64,
     env: Vec<(String, String)>,
+    preopened_dirs: Vec<PathBuf>,
     tracker: TaskTracker,
 }
 
@@ -152,22 +177,44 @@ impl ProxyHandler {
     fn new(
         instance_pre: ProxyPre<WasiPreview2Ctx>,
         env: Vec<(String, String)>,
+        preopened_dirs: Vec<PathBuf>,
         tracker: TaskTracker,
     ) -> Self {
         ProxyHandler {
             instance_pre,
             env,
+            preopened_dirs,
             tracker,
             next_id: AtomicU64::from(0),
         }
     }
 
-    fn wasi_store_for_request(&self, req_id: u64) -> Store<WasiPreview2Ctx> {
+    fn wasi_store_for_request(&self, req_id: u64) -> Result<Store<WasiPreview2Ctx>> {
         let engine = self.instance_pre.engine();
         let mut builder = wasmtime_wasi::p2::WasiCtxBuilder::new();
 
+        let file_perms = FilePerms::all();
+        let dir_perms = DirPerms::all();
+
         builder.envs(&self.env);
         builder.env("REQUEST_ID", req_id.to_string());
+        builder.inherit_stdio();
+        builder.inherit_network();
+        builder.allow_tcp(true);
+        builder.allow_udp(true);
+        builder.allow_ip_name_lookup(true);
+
+        // Preopen root directory
+        builder.preopened_dir("/", "/", dir_perms, file_perms)?;
+
+        // Preopen bind mount directories from OCI spec
+        for dir in &self.preopened_dirs {
+            let dir_str = dir.to_string_lossy();
+            log::info!("HTTP Proxy: preopening {}", dir_str);
+            if let Err(e) = builder.preopened_dir(dir, dir_str.as_ref(), dir_perms, file_perms) {
+                log::warn!("HTTP Proxy: failed to preopen {}: {}", dir_str, e);
+            }
+        }
 
         let ctx = WasiPreview2Ctx {
             wasi_ctx: builder.build(),
@@ -175,7 +222,7 @@ impl ProxyHandler {
             resource_table: ResourceTable::default(),
         };
 
-        Store::new(engine, ctx)
+        Ok(Store::new(engine, ctx))
     }
 
     async fn handle_request(
@@ -192,7 +239,7 @@ impl ProxyHandler {
             req.uri()
         );
 
-        let mut store = self.wasi_store_for_request(req_id);
+        let mut store = self.wasi_store_for_request(req_id)?;
 
         let req = store.data_mut().new_incoming_request(Scheme::Http, req)?;
         let out = store.data_mut().new_response_outparam(sender)?;

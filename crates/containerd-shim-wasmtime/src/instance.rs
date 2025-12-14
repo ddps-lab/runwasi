@@ -397,7 +397,7 @@ fn store_for_context<T: wasi_preview2::WasiView>(
     Ok((store, linker))
 }
 
-fn wasi_builder(ctx: &impl RuntimeContext) -> Result<wasi_preview2::WasiCtxBuilder, anyhow::Error> {
+pub(crate) fn wasi_builder(ctx: &impl RuntimeContext) -> Result<wasi_preview2::WasiCtxBuilder, anyhow::Error> {
     // TODO: make this more configurable (e.g. allow the user to specify the
     // preopened directories and their permissions)
     // https://github.com/containerd/runwasi/issues/413
