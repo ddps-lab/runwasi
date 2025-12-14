@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use oci_spec::image::Descriptor;
-use oci_spec::runtime::Spec;
+use oci_spec::runtime::{Mount, Spec};
 use serde::{Deserialize, Serialize};
 use wasmparser::Parser;
 
@@ -32,6 +32,10 @@ pub trait RuntimeContext: Send + Sync {
     ///   "my_module.wat" -> { source: File("my_module.wat"), func: "_start", name: "Some(my_module)", arg0: "my_module.wat" }
     ///   "#init" -> { source: File(""), func: "init", name: None, arg0: "#init" }
     fn entrypoint(&self) -> Entrypoint;
+
+    /// Returns the mounts from the OCI runtime spec.
+    /// Used for preopening directories in WASI (e.g., Kubernetes volume mounts).
+    fn mounts(&self) -> Option<&[Mount]>;
 }
 
 /// The source for a WASI module / components.
@@ -135,6 +139,10 @@ impl RuntimeContext for WasiContext<'_> {
             source,
             name: module_name,
         }
+    }
+
+    fn mounts(&self) -> Option<&[Mount]> {
+        self.spec.mounts().as_ref().map(|m| m.as_slice())
     }
 }
 

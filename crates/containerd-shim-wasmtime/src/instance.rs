@@ -418,6 +418,31 @@ fn wasi_builder(ctx: &impl RuntimeContext) -> Result<wasi_preview2::WasiCtxBuild
         .allow_ip_name_lookup(true)
         .preopened_dir("/", "/", dir_perms, file_perms)?;
 
+    // Preopen directories from OCI spec mounts (e.g., Kubernetes volume mounts)
+    // This enables WASM modules to access mounted volumes like PVCs and NFS shares
+    if let Some(mounts) = ctx.mounts() {
+        for mount in mounts {
+            let dest = mount.destination();
+            let dest_str = dest.to_string_lossy();
+            // Skip system directories that are already covered by "/" preopen
+            // or shouldn't be directly preopened
+            if dest_str.starts_with("/proc")
+                || dest_str.starts_with("/sys")
+                || dest_str.starts_with("/dev")
+                || dest_str == "/"
+            {
+                continue;
+            }
+            // Only preopen bind mounts (typically volume mounts from K8s)
+            if mount.typ().as_deref() == Some("bind") {
+                log::debug!("preopening mount destination: {}", dest_str);
+                if let Err(e) = builder.preopened_dir(&dest, dest_str.as_ref(), dir_perms, file_perms) {
+                    log::warn!("failed to preopen mount {}: {}", dest_str, e);
+                }
+            }
+        }
+    }
+
     log::debug!("WASI context built successfully");
     Ok(builder)
 }
