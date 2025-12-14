@@ -421,9 +421,13 @@ fn wasi_builder(ctx: &impl RuntimeContext) -> Result<wasi_preview2::WasiCtxBuild
     // Preopen directories from OCI spec mounts (e.g., Kubernetes volume mounts)
     // This enables WASM modules to access mounted volumes like PVCs and NFS shares
     if let Some(mounts) = ctx.mounts() {
+        log::info!("Processing {} mounts for preopen", mounts.len());
         for mount in mounts {
             let dest = mount.destination();
             let dest_str = dest.to_string_lossy();
+            let mount_type = mount.typ().as_deref().unwrap_or("unknown");
+            log::info!("Mount: type={}, dest={}", mount_type, dest_str);
+
             // Skip system directories that are already covered by "/" preopen
             // or shouldn't be directly preopened
             if dest_str.starts_with("/proc")
@@ -431,16 +435,20 @@ fn wasi_builder(ctx: &impl RuntimeContext) -> Result<wasi_preview2::WasiCtxBuild
                 || dest_str.starts_with("/dev")
                 || dest_str == "/"
             {
+                log::info!("Skipping system mount: {}", dest_str);
                 continue;
             }
             // Only preopen bind mounts (typically volume mounts from K8s)
-            if mount.typ().as_deref() == Some("bind") {
-                log::debug!("preopening mount destination: {}", dest_str);
-                if let Err(e) = builder.preopened_dir(&dest, dest_str.as_ref(), dir_perms, file_perms) {
-                    log::warn!("failed to preopen mount {}: {}", dest_str, e);
+            if mount_type == "bind" {
+                log::info!("Preopening bind mount: {}", dest_str);
+                match builder.preopened_dir(&dest, dest_str.as_ref(), dir_perms, file_perms) {
+                    Ok(_) => log::info!("Successfully preopened: {}", dest_str),
+                    Err(e) => log::warn!("Failed to preopen mount {}: {}", dest_str, e),
                 }
             }
         }
+    } else {
+        log::info!("No mounts found in context");
     }
 
     log::debug!("WASI context built successfully");
